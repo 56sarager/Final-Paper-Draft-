@@ -1,0 +1,188 @@
+#Generates S1 Data and Violation Percentage for Agroculture related Tickers
+#Outputs s1_values.csv and violation_pct.csv
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import itertools
+from tqdm import tqdm
+from datetime import date
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+import os
+import plotly.io as pio
+
+pio.renderers.default = "browser"
+
+#========================================================================================================
+#Data
+#========================================================================================================
+
+def yf_stocks():
+    df = pd.read_csv("yfinance_tickers.csv")
+    tickers = df['ticker'].tolist()
+    return tickers
+
+def download_yf_data(tickers, START_DATE = "2000-01-01", END_DATE   = date.today().strftime("%Y-%m-%d")):
+    '''Returns percent change in adjusted close price for a list of Yahoo Finance tickers between a specified START_DATE and END_DATE'''
+    print(f"Downloading data for {len(tickers)} tickers from {START_DATE} to {END_DATE}...")
+    raw = yf.download(tickers, start=START_DATE, end=END_DATE,
+                    group_by="ticker", auto_adjust=True, threads=True, progress=False)
+
+    adj_close = pd.DataFrame()
+    for t in tickers:
+        try:
+            adj_close[t] = raw[t]['Close']
+        except Exception:
+            continue
+
+    adj_close = adj_close.dropna(axis=1, how="all")
+    returns = adj_close.pct_change().dropna(how="all").sort_index()
+    print(f"Final usable tickers: {len(returns.columns)}")
+    print(f"Returns shape: {returns.shape}")
+    return returns
+
+#========================================================================================================
+#Computation
+#========================================================================================================
+
+def compute_s1_sliding_pair(x, y, window_size=20, q=0.95, std_mult=2.0, fixed_thr=0.05, mode="fixed"):
+
+    #Creates windows
+    n = x.shape[0]
+    m = n - window_size
+    if m <= 0:
+        return np.array([])
+
+    shape = (m, window_size)
+    stride = x.strides[0]
+    x_win = np.lib.stride_tricks.as_strided(x, shape=shape, strides=(stride, stride)).copy()
+    y_win = np.lib.stride_tricks.as_strided(y, shape=shape, strides=(stride, stride)).copy()
+
+    #Calculates sign and magnitude for each element in the window
+    a_sgn, b_sgn = np.sign(x_win), np.sign(y_win)
+    abs_x, abs_y = np.abs(x_win), np.abs(y_win)
+
+    #Applies a mask for a fixed threshold
+    if mode == "fixed":
+        thr_x = fixed_thr
+        thr_y = fixed_thr
+        mask_x0 = abs_x >= thr_x
+        mask_y0 = abs_y >= thr_y
+
+    #Applies a mask for a quantile based threshold
+    elif mode == "percentile":
+        thr_x = np.quantile(abs_x, q, axis=1)
+        thr_y = np.quantile(abs_y, q, axis=1)
+        mask_x0 = abs_x >= thr_x[:, None]
+        mask_y0 = abs_y >= thr_y[:, None]
+
+    #Applies a mask for a standard deviation based threshold
+    elif mode == "std":
+        thr_x = abs_x.std(axis=1) * std_mult
+        thr_y = abs_y.std(axis=1) * std_mult
+        mask_x0 = abs_x >= thr_x[:, None]
+        mask_y0 = abs_y >= thr_y[:, None]
+
+    else:
+        raise ValueError("mode must be one of {'fixed', 'percentile', 'std'}")
+
+    #Calculates expectations as the average sign product of terms in the mask
+    def E(mask):
+        term = (a_sgn * b_sgn) * mask
+        s = term.sum(axis=1)
+        cnt = mask.sum(axis=1)
+        e = np.zeros_like(s, dtype=float)
+        nz = cnt > 0
+        e[nz] = s[nz] / cnt[nz]
+        return e
+
+    return E(mask_x0 & ~mask_y0)+ E(mask_x0 & mask_y0)+ E(~mask_x0 & mask_y0)- E(~mask_x0 & ~mask_y0)
+
+def run_computation(
+    returns,
+    OUTPUT_PCT_CSV="violation_pct.csv",
+    OUTPUT_S1_CSV="s1_values.csv",
+    WINDOW_SIZE=20,
+    mode="fixed",
+    fixed_thr=0.05,
+    THRESHOLD_Q=0.95,
+    STD_MULT=2.0,
+    BOUND=2
+):
+    '''Creates two data sets of S1 values between stocks on a given date and number of S1 values exceeding a specified bound using a specified rolling window'''
+    dates = returns.index[WINDOW_SIZE:]
+    violation_counts = np.zeros(len(dates), dtype=int)
+    total_counts = np.zeros(len(dates), dtype=int)
+
+    s1_records = []  
+
+    pairs = itertools.combinations(returns.columns, 2)
+    for A, B in tqdm(pairs, total=(len(returns.columns)*(len(returns.columns)-1))//2,
+                     desc="Pairs"):
+        ts = returns[[A, B]].dropna()
+        if ts.shape[0] <= WINDOW_SIZE:
+            continue
+
+        x, y = ts[A].values, ts[B].values
+        S1 = compute_s1_sliding_pair(
+            x, y,
+            window_size=WINDOW_SIZE,
+            q=THRESHOLD_Q,
+            std_mult=STD_MULT,
+            fixed_thr=fixed_thr,
+            mode=mode
+        )
+
+        if S1.size == 0:
+            continue
+
+        pair_dates = ts.index[WINDOW_SIZE:]
+        pos = np.searchsorted(dates, pair_dates)
+        valid = (pos >= 0) & (pos < len(dates))
+        pos, S1, pair_dates = pos[valid], S1[valid], pair_dates[valid]
+
+        np.add.at(total_counts, pos, 1)
+        np.add.at(violation_counts, pos, (np.abs(S1) > BOUND).astype(int))
+
+        for d, s in zip(pair_dates, S1):
+            s1_records.append((d, A, B, s))
+
+    pct = np.where(total_counts > 0, 100 * violation_counts / total_counts, np.nan)
+    out_df = pd.DataFrame({
+        "Date": dates,
+        "ViolationPct": pct,
+        "TotalPairs": total_counts,
+        "ViolationCounts": violation_counts
+    })
+    out_df.to_csv(OUTPUT_PCT_CSV, index=False)
+    print(f"Saved percent violation to {OUTPUT_PCT_CSV}")
+
+    if s1_records:
+        s1_df = pd.DataFrame(s1_records, columns=["Date", "PairA", "PairB", "S1"])
+        s1_df = s1_df.sort_values("Date")
+        s1_df.to_csv(OUTPUT_S1_CSV, index=False)
+        print(f"Saved detailed S1 values to {OUTPUT_S1_CSV}")
+    else:
+        print("No S1 data to save.")
+
+    return out_df
+
+#========================================================================================================
+#Composite Functions (Final)
+#========================================================================================================
+
+def yf_stock_data_plotly():
+    tickers = yf_stocks()
+    returns = download_yf_data(tickers, "2000-01-01", date.today().strftime("%Y-%m-%d"))
+    run_computation(
+        returns,
+        OUTPUT_PCT_CSV="Results/violation_pct.csv",
+        OUTPUT_S1_CSV="Results/s1_values.csv",
+        WINDOW_SIZE=20,
+        mode="fixed",
+        BOUND=2
+    )
+
+yf_stock_data_plotly()
